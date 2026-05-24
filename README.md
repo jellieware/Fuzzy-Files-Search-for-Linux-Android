@@ -12,4 +12,4 @@ Compile on Linux with:
 clang fast_search.c -o fast_search
 
 <br><br>
-<img width="1080" height="2400" alt="1001291610" src="https://github.com/user-attachments/assets/aef40cef-65cd-468e-a06d-ed47c7f6c994" />
+<img width="1080" height="2400" alt="1001291618" src="https://github.com/user-attachments/assets/53c09edf-c973-42b5-b032-2f5a8fa79cff" />
