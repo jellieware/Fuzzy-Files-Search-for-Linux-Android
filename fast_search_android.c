@@ -91,6 +91,7 @@ int main(void) {
 
     printf("\n" COLOR_INFO "Total unique file paths matching query: %d" COLOR_RESET "\n", total_matches);
     //return 0;
+    total_matches=0;
     }
 }
 
