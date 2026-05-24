@@ -1,77 +1,173 @@
-#define _XOPEN_SOURCE 500
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ftw.h>
-#include <stdint.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <signal.h>
+#include <stdbool.h>
 
-#define MAX_TERMS 16
-#define COLOR_MATCH "\033[1;31m" // Bold Red
-#define COLOR_RESET "\033[0m"
+#define MAX_PATH 4096
+#define INITIAL_CAPACITY 1024
+#define MAX_TOKENS 32
+#define RED_TEXT "\033[1;31m"
+#define RESET_TEXT "\033[0m"
 
-// Global configuration and counters
-char *search_terms[MAX_TERMS];
-int term_count = 0;
-uint64_t total_matches = 0;
+typedef struct {
+    char *start;
+    size_t len;
+} MatchToken;
 
-// High-performance substring checker mimicking fzf multi-word logic
-inline int match_all_terms(const char *path) {
-    for (int i = 0; i < term_count; i++) {
-        if (!strcasestr(path, search_terms[i])) {
-            return 0; // Missing at least one word, reject immediately
+char **file_list = NULL;
+size_t file_count = 0;
+size_t file_capacity = 0;
+
+void handle_sigint(int sig) {
+    (void)sig;
+    printf("\nExiting scanner.\n");
+    for (size_t i = 0; i < file_count; i++) {
+        free(file_list[i]);
+    }
+    free(file_list);
+    exit(0);
+}
+
+void add_to_list(const char *path) {
+    if (file_count >= file_capacity) {
+        file_capacity = file_capacity == 0 ? INITIAL_CAPACITY : file_capacity * 2;
+        char **new_list = realloc(file_list, file_capacity * sizeof(char *));
+        if (!new_list) return;
+        file_list = new_list;
+    }
+    file_list[file_count] = strdup(path);
+    if (file_list[file_count]) {
+        file_count++;
+    }
+}
+
+void scan_directory(const char *dir_name) {
+    DIR *dir = opendir(dir_name);
+    if (!dir) return;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char path[MAX_PATH];
+        int len = snprintf(path, sizeof(path), "%s/%s", dir_name, entry->d_name);
+        if (len >= (int)sizeof(path)) continue;
+
+        add_to_list(path);
+
+        if (entry->d_type == DT_DIR) {
+            scan_directory(path);
+        } else if (entry->d_type == DT_UNKNOWN) {
+            struct stat sb;
+            if (stat(path, &sb) == 0 && S_ISDIR(sb.st_mode)) {
+                scan_directory(path);
+            }
         }
     }
-    return 1; // All words found in the path regardless of order
+    closedir(dir);
 }
 
-// Function to print path with colored keyword highlights
-void print_highlighted(const char *path) {
-    // Basic fast print. For complex overlapping intervals, an interval tree is needed.
-    // This highlights the first occurrence of each search term rapidly.
-    printf("%s\n", path);
+// Comparison function to sort match tokens by their appearance order in the string
+int compare_tokens(const void *a, const void *b) {
+    const MatchToken *ta = (const MatchToken *)a;
+    const MatchToken *tb = (const MatchToken *)b;
+    if (ta->start < tb->start) return -1;
+    if (ta->start > tb->start) return 1;
+    return 0;
 }
 
-// Native POSIX tree walker callback (Faster than spawning external 'find')
-int process_file(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
-    // Skip broken links or unreadable files if needed, but process everything else
-    if (match_all_terms(fpath)) {
-        total_matches++;
-        // Print matching path. Use printf("%s\n", fpath); for raw speed.
-        printf(COLOR_MATCH "[MATCH] " COLOR_RESET "%s\n", fpath);
-    }
-    return 0; // Tell nftw to keep crawling
-}
+void search_and_print(char *query) {
+    size_t match_count = 0;
+    char *tokens[MAX_TOKENS];
+    int token_count = 0;
 
-int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s \"space separated search terms\"\n", argv[0]);
-        return 1;
-    }
-
-    // Tokenize the multi-word input string into distinct search terms
-    char *input_copy = strdup(argv[1]);
-    char *token = strtok(input_copy, " ");
-    while (token && term_count < MAX_TERMS) {
-        search_terms[term_count++] = token;
+    // Tokenize the input query by spaces safely
+    char *query_copy = strdup(query);
+    char *token = strtok(query_copy, " ");
+    while (token != NULL && token_count < MAX_TOKENS) {
+        tokens[token_count++] = token;
         token = strtok(NULL, " ");
     }
 
-    if (term_count == 0) {
-        fprintf(stderr, "Error: No search terms provided.\n");
-        free(input_copy);
-        return 1;
+    if (token_count == 0) {
+        free(query_copy);
+        return;
     }
 
-    printf("Searching system for paths containing all terms sequentially/unordered...\n");
+    MatchToken current_matches[MAX_TOKENS];
 
-    // Crawl from the root directory '/'
-    // 64 is the max open file descriptors nftw will hold simultaneously for speed
-    // FTW_PHYS avoids endless loops via symbolic links
-    nftw("/", process_file, 64, FTW_PHYS);
+    for (size_t i = 0; i < file_count; i++) {
+        char *path = file_list[i];
+        bool all_tokens_matched = true;
 
-    printf("\n" COLOR_MATCH "Search Complete. Total Matches Found: %lu" COLOR_RESET "\n", total_matches);
+        // Check if all tokens exist in the path string
+        for (int t = 0; t < token_count; t++) {
+            char *loc = strstr(path, tokens[t]);
+            if (!loc) {
+                all_tokens_matched = false;
+                break;
+            }
+            current_matches[t].start = loc;
+            current_matches[t].len = strlen(tokens[t]);
+        }
 
-    free(input_copy);
+        if (all_tokens_matched) {
+            match_count++;
+
+            // Sort tokens by their memory address location to print sequentially
+            qsort(current_matches, token_count, sizeof(MatchToken), compare_tokens);
+
+            char *current_ptr = path;
+            for (int t = 0; t < token_count; t++) {
+                // Ensure we don't print overlapping or backward segments
+                if (current_matches[t].start >= current_ptr) {
+                    // Print plain text before the match
+                    printf("%.*s", (int)(current_matches[t].start - current_ptr), current_ptr);
+                    // Print highlighted match keyword
+                    printf("%s%.*s%s", RED_TEXT, (int)current_matches[t].len, current_matches[t].start, RESET_TEXT);
+                    current_ptr = current_matches[t].start + current_matches[t].len;
+                }
+            }
+            // Print the rest of the file path
+            printf("%s\n", current_ptr);
+        }
+    }
+    printf("\nTotal Matches Found: %zu\n", match_count);
+    free(query_copy);
+}
+
+int main(void) {
+    signal(SIGINT, handle_sigint);
+
+    printf("Scanning entire file system... Please wait.\n");
+    scan_directory("/");
+    printf("Scan complete. Loaded %zu paths.\n\n", file_count);
+
+    char *input_buffer = NULL;
+    size_t buffer_size = 0;
+
+    while (1) {
+        printf("fzf-search> ");
+        fflush(stdout);
+
+        if (getline(&input_buffer, &buffer_size, stdin) == -1) {
+            break;
+        }
+
+        input_buffer[strcspn(input_buffer, "\n")] = '\0';
+
+        search_and_print(input_buffer);
+        printf("----------------------------------------\n");
+    }
+
+    free(input_buffer);
+    handle_sigint(0);
     return 0;
 }
