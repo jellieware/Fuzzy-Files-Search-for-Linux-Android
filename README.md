@@ -16,4 +16,6 @@ Compile on Linux with:
 clang -03 fast_search.c -o fast_search
 
 <br><br>
-<img width="1080" height="2400" alt="1001291618" src="https://github.com/user-attachments/assets/53c09edf-c973-42b5-b032-2f5a8fa79cff" />
+
+https://github.com/user-attachments/assets/bd890726-984d-4e29-b39f-865f49e69602
+
