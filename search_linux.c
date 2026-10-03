@@ -12,7 +12,7 @@
 #include <termios.h>
 #include <errno.h>
 
-volatile bool keep_running = true;
+volatile sig_atomic_t keep_running = 1;
 
 #define MAX_PATH_LEN 1024
 #define MAX_TOKENS 16
@@ -41,12 +41,12 @@ typedef struct {
     const char *extensions;
 } SearchCategory;
 
+
 /*
  * Category 1 is ALL: it accepts every known extension below.
  * Categories 2-8 are filtered strictly by extension.
  *
- * 9 and 10 are intentionally left available as unused/reserved toggles
- * because the requested category list defines only categories 1-8.
+ * 9 and 10 remain reserved.
  */
 static const char *ALL_EXTENSIONS[] = {
     /* Photos / images */
@@ -106,6 +106,7 @@ static const char *ALL_EXTENSIONS[] = {
 
 #define ALL_EXTENSION_COUNT \
     (sizeof(ALL_EXTENSIONS) / sizeof(ALL_EXTENSIONS[0]))
+
 
 static const char *PHOTO_EXTENSIONS[] = {
     ".jpg",".jpeg",".jpe",".jfif",".png",".gif",".bmp",".dib",".webp",
@@ -170,18 +171,25 @@ static const char *SCRIPT_EXTENSIONS[] = {
 
 #define PHOTO_COUNT \
     (sizeof(PHOTO_EXTENSIONS) / sizeof(PHOTO_EXTENSIONS[0]))
+
 #define AUDIO_COUNT \
     (sizeof(AUDIO_EXTENSIONS) / sizeof(AUDIO_EXTENSIONS[0]))
+
 #define DOCUMENT_COUNT \
     (sizeof(DOCUMENT_EXTENSIONS) / sizeof(DOCUMENT_EXTENSIONS[0]))
+
 #define ARCHIVE_COUNT \
     (sizeof(ARCHIVE_EXTENSIONS) / sizeof(ARCHIVE_EXTENSIONS[0]))
+
 #define VIDEO_COUNT \
     (sizeof(VIDEO_EXTENSIONS) / sizeof(VIDEO_EXTENSIONS[0]))
+
 #define APPLICATION_COUNT \
     (sizeof(APPLICATION_EXTENSIONS) / sizeof(APPLICATION_EXTENSIONS[0]))
+
 #define SCRIPT_COUNT \
     (sizeof(SCRIPT_EXTENSIONS) / sizeof(SCRIPT_EXTENSIONS[0]))
+
 
 static const SearchCategory CATEGORIES[] = {
     {1, "ALL FILES", "all"},
@@ -196,34 +204,71 @@ static const SearchCategory CATEGORIES[] = {
     {10, "RESERVED", "reserved"}
 };
 
+
 static int selected_category = 1;
 static int total_matches = 0;
 
+
+/*
+ * Runtime scan statistics.
+ *
+ * These are intentionally global so the recursive scanner can update
+ * the progress display without passing a large state structure through
+ * every recursive call.
+ */
+static unsigned long long scanned_entries = 0;
+static unsigned long long scanned_files = 0;
+static unsigned long long scanned_directories = 0;
+static unsigned long long skipped_directories = 0;
+static unsigned long long skipped_symlinks = 0;
+static unsigned long long stat_errors = 0;
+
+static struct timespec last_progress_time = {0, 0};
+
+
+/*
+ * Ctrl+C handler.
+ *
+ * Do NOT printf() from a signal handler. printf() is not async-signal-safe
+ * and doing so can occasionally make an interrupted program behave badly.
+ */
 void handle_sigint(int sig) {
-    printf("\nStopped by Ctrl+C (Signal %d). Cleaning up...\n", sig);
-    keep_running = false;
+    (void)sig;
+    keep_running = 0;
 }
+
 
 void auto_discover_storage(StoragePaths *paths);
 int tokenize_query(const char *query, QueryConfig *q_cfg);
 int execute_fzf_v1_match(const char *text,
                          const QueryConfig *q_cfg,
                          char *marker_mask);
+
 void print_highlighted_result(const char *text,
                               const char *marker_mask,
                               time_t modification_time);
+
 void search_directory_recursive(const char *dir_path,
                                 const QueryConfig *q_cfg);
+
 void print_category_menu(void);
 int read_category_toggle(void);
+
 int extension_matches_category(const char *filename, int category);
 int has_extension(const char *filename, const char *ext);
 const char *get_extension(const char *filename);
+
 int extension_in_list(const char *ext,
                       const char *list[],
                       size_t count);
 
-static void lowercase_copy(const char *src, char *dst, size_t size) {
+
+/*
+ * Convert a string to lowercase safely.
+ */
+static void lowercase_copy(const char *src,
+                           char *dst,
+                           size_t size) {
     size_t i;
 
     if (size == 0)
@@ -235,6 +280,10 @@ static void lowercase_copy(const char *src, char *dst, size_t size) {
     dst[i] = '\0';
 }
 
+
+/*
+ * Get the file extension.
+ */
 const char *get_extension(const char *filename) {
     const char *base = strrchr(filename, '/');
     const char *dot = strrchr(filename, '.');
@@ -242,15 +291,20 @@ const char *get_extension(const char *filename) {
     if (!dot ||
         (base && dot < base) ||
         dot == filename ||
-        dot[1] == '\0')
+        dot[1] == '\0') {
         return NULL;
+    }
 
     return dot;
 }
 
-int has_extension(const char *filename, const char *ext) {
+
+int has_extension(const char *filename,
+                  const char *ext) {
     const char *actual = get_extension(filename);
-    char a[32], b[32];
+
+    char a[32];
+    char b[32];
 
     if (!actual)
         return 0;
@@ -261,6 +315,7 @@ int has_extension(const char *filename, const char *ext) {
     return strcmp(a, b) == 0;
 }
 
+
 int extension_in_list(const char *ext,
                       const char *list[],
                       size_t count) {
@@ -269,12 +324,16 @@ int extension_in_list(const char *ext,
     if (!ext)
         return 0;
 
-    lowercase_copy(ext, lower_ext, sizeof(lower_ext));
+    lowercase_copy(ext,
+                   lower_ext,
+                   sizeof(lower_ext));
 
     for (size_t i = 0; i < count; ++i) {
         char lower_list[32];
 
-        lowercase_copy(list[i], lower_list, sizeof(lower_list));
+        lowercase_copy(list[i],
+                       lower_list,
+                       sizeof(lower_list));
 
         if (strcmp(lower_ext, lower_list) == 0)
             return 1;
@@ -283,7 +342,9 @@ int extension_in_list(const char *ext,
     return 0;
 }
 
-int extension_matches_category(const char *filename, int category) {
+
+int extension_matches_category(const char *filename,
+                               int category) {
     const char *ext = get_extension(filename);
 
     if (!ext)
@@ -292,44 +353,208 @@ int extension_matches_category(const char *filename, int category) {
     switch (category) {
         case 1:
             return extension_in_list(
-                ext, ALL_EXTENSIONS, ALL_EXTENSION_COUNT);
+                ext,
+                ALL_EXTENSIONS,
+                ALL_EXTENSION_COUNT
+            );
 
         case 2:
             return extension_in_list(
-                ext, PHOTO_EXTENSIONS, PHOTO_COUNT);
+                ext,
+                PHOTO_EXTENSIONS,
+                PHOTO_COUNT
+            );
 
         case 3:
             return extension_in_list(
-                ext, AUDIO_EXTENSIONS, AUDIO_COUNT);
+                ext,
+                AUDIO_EXTENSIONS,
+                AUDIO_COUNT
+            );
 
         case 4:
             return extension_in_list(
-                ext, DOCUMENT_EXTENSIONS, DOCUMENT_COUNT);
+                ext,
+                DOCUMENT_EXTENSIONS,
+                DOCUMENT_COUNT
+            );
 
         case 5:
             return extension_in_list(
-                ext, ARCHIVE_EXTENSIONS, ARCHIVE_COUNT);
+                ext,
+                ARCHIVE_EXTENSIONS,
+                ARCHIVE_COUNT
+            );
 
         case 6:
             return extension_in_list(
-                ext, VIDEO_EXTENSIONS, VIDEO_COUNT);
+                ext,
+                VIDEO_EXTENSIONS,
+                VIDEO_COUNT
+            );
 
         case 7:
             return extension_in_list(
-                ext, APPLICATION_EXTENSIONS, APPLICATION_COUNT);
+                ext,
+                APPLICATION_EXTENSIONS,
+                APPLICATION_COUNT
+            );
 
         case 8:
             return extension_in_list(
-                ext, SCRIPT_EXTENSIONS, SCRIPT_COUNT);
+                ext,
+                SCRIPT_EXTENSIONS,
+                SCRIPT_COUNT
+            );
 
         default:
             return 0;
     }
 }
 
+
+/*
+ * Linux root contains several pseudo-filesystems that should not be
+ * recursively scanned as normal user files.
+ *
+ * /proc = kernel process information
+ * /sys  = kernel/device information
+ * /dev  = device nodes
+ * /run  = runtime state, sockets and transient files
+ *
+ * These are excluded specifically to prevent a recursive "/" search
+ * from hanging or spending enormous amounts of time inside virtual
+ * kernel trees.
+ */
+static int should_skip_directory(const char *path) {
+    if (strcmp(path, "/proc") == 0)
+        return 1;
+
+    if (strcmp(path, "/sys") == 0)
+        return 1;
+
+    if (strcmp(path, "/dev") == 0)
+        return 1;
+
+    if (strcmp(path, "/run") == 0)
+        return 1;
+
+    return 0;
+}
+
+
+/*
+ * Return elapsed milliseconds between two monotonic timestamps.
+ */
+static long long elapsed_ms(const struct timespec *a,
+                            const struct timespec *b) {
+    long long sec =
+        (long long)b->tv_sec - (long long)a->tv_sec;
+
+    long long nsec =
+        (long long)b->tv_nsec - (long long)a->tv_nsec;
+
+    return sec * 1000LL + nsec / 1000000LL;
+}
+
+
+/*
+ * Display live scanning progress approximately every 250 ms.
+ *
+ * The actual search still runs continuously; this only throttles the
+ * terminal output so printing progress does not itself make the search
+ * slow.
+ */
+static void update_progress(const char *current_path) {
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return;
+
+    if (last_progress_time.tv_sec != 0 ||
+        last_progress_time.tv_nsec != 0) {
+
+        if (elapsed_ms(&last_progress_time, &now) < 250)
+            return;
+    }
+
+    last_progress_time = now;
+
+    /*
+     * \033[K clears the rest of the current terminal line.
+     *
+     * %-100.100s prevents an extremely long path from wrapping into
+     * multiple lines.
+     */
+    printf(
+        "\r\033[K"
+        "Scanning: %-100.100s"
+        " | entries: %llu"
+        " | files: %llu"
+        " | matches: %d",
+        current_path,
+        scanned_entries,
+        scanned_files,
+        total_matches
+    );
+
+    fflush(stdout);
+}
+
+
+/*
+ * Print a final scan summary.
+ */
+static void print_scan_summary(void) {
+    printf("\n\n");
+
+    printf(
+        COLOR_INFO
+        "Scan statistics:"
+        COLOR_RESET "\n"
+    );
+
+    printf(
+        "  Entries scanned      : %llu\n",
+        scanned_entries
+    );
+
+    printf(
+        "  Files examined       : %llu\n",
+        scanned_files
+    );
+
+    printf(
+        "  Directories entered  : %llu\n",
+        scanned_directories
+    );
+
+    printf(
+        "  Directories skipped  : %llu\n",
+        skipped_directories
+    );
+
+    printf(
+        "  Symlinks skipped     : %llu\n",
+        skipped_symlinks
+    );
+
+    printf(
+        "  stat/lstat errors    : %llu\n",
+        stat_errors
+    );
+}
+
+
+/*
+ * Category menu.
+ */
 void print_category_menu(void) {
-    printf("\n" COLOR_INFO "Search category toggles:"
-           COLOR_RESET "\n");
+    printf(
+        "\n" COLOR_INFO
+        "Search category toggles:"
+        COLOR_RESET "\n"
+    );
 
     printf("  1  ALL FILES\n");
     printf("  2  PHOTOS / IMAGES\n");
@@ -342,36 +567,55 @@ void print_category_menu(void) {
     printf("  9  RESERVED\n");
     printf("  0  RESERVED\n");
 
-    printf("Current: " COLOR_INFO "%s" COLOR_RESET "\n",
-           CATEGORIES[selected_category - 1].name);
+    printf(
+        "Current: "
+        COLOR_INFO "%s"
+        COLOR_RESET "\n",
+        CATEGORIES[selected_category - 1].name
+    );
 }
 
+
+/*
+ * Interactive category selector.
+ */
 int read_category_toggle(void) {
-    /*
-     * Plain number keys are used as category hotkeys.
-     * 1-8 select the requested categories.
-     * 9 and 0 remain reserved.
-     */
-    struct termios oldt, newt;
+    struct termios oldt;
+    struct termios newt;
+
     unsigned char ch = 0;
 
     if (tcgetattr(STDIN_FILENO, &oldt) != 0)
         return 0;
 
     newt = oldt;
+
     newt.c_lflag &= (tcflag_t)~(ICANON | ECHO);
+
     newt.c_cc[VMIN] = 1;
     newt.c_cc[VTIME] = 0;
 
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0)
+    if (tcsetattr(STDIN_FILENO,
+                   TCSANOW,
+                   &newt) != 0) {
         return 0;
+    }
 
-    printf("\nPress 1 through 8 to select a category.\n");
-    printf("Press Enter when ready to enter the search query.\n");
+    printf(
+        "\nPress 1 through 8 to select a category.\n"
+    );
+
+    printf(
+        "Press Enter when ready to enter the search query.\n"
+    );
+
     fflush(stdout);
 
     while (read(STDIN_FILENO, &ch, 1) == 1) {
         int category = 0;
+
+        if (!keep_running)
+            break;
 
         switch (ch) {
             case '1':
@@ -418,7 +662,12 @@ int read_category_toggle(void) {
 
             case '\n':
             case '\r':
-                tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+                tcsetattr(
+                    STDIN_FILENO,
+                    TCSANOW,
+                    &oldt
+                );
+
                 return selected_category;
 
             default:
@@ -427,18 +676,34 @@ int read_category_toggle(void) {
 
         selected_category = category;
 
-        printf("\nSelected: " COLOR_INFO "%s" COLOR_RESET "\n",
-               CATEGORIES[selected_category - 1].name);
+        printf(
+            "\nSelected: "
+            COLOR_INFO "%s"
+            COLOR_RESET "\n",
+            CATEGORIES[selected_category - 1].name
+        );
 
-        printf("Press Enter to search, or 1..8 to change category.\n");
+        printf(
+            "Press Enter to search, "
+            "or 1..8 to change category.\n"
+        );
+
         fflush(stdout);
     }
 
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    tcsetattr(
+        STDIN_FILENO,
+        TCSANOW,
+        &oldt
+    );
 
     return selected_category;
 }
 
+
+/*
+ * Main program.
+ */
 int main(void) {
     signal(SIGINT, handle_sigint);
 
@@ -447,155 +712,324 @@ int main(void) {
 
         auto_discover_storage(&paths);
 
-        printf(COLOR_INFO
-               "--- Linux Root Filesystem Search ---\n"
-               COLOR_RESET);
+        printf(
+            COLOR_INFO
+            "--- Linux Root Filesystem Search ---\n"
+            COLOR_RESET
+        );
 
-        printf("Root Path     : " COLOR_PATH "%s\n" COLOR_RESET,
-               paths.internal);
+        printf(
+            "Root Path: "
+            COLOR_PATH "%s\n"
+            COLOR_RESET,
+            paths.internal
+        );
 
-        printf("-----------------------------------------\n");
+        printf(
+            "Virtual kernel filesystems: "
+            "SKIPPED (/proc /sys /dev /run)\n"
+        );
+
+        printf(
+            "Symbolic links: SKIPPED\n"
+        );
+
+        printf(
+            "-------------------------------------\n"
+        );
 
         print_category_menu();
 
         /*
-         * Interactive number-key category selector.
-         * If stdin is not a terminal, keep category 1 (ALL).
+         * Interactive category selector.
+         *
+         * If stdin is not a terminal, retain category 1.
          */
         if (isatty(STDIN_FILENO))
             read_category_toggle();
 
+        if (!keep_running)
+            break;
+
         char query_buffer[256];
 
-        printf("\nEnter multi-word fuzzy search query: ");
+        printf(
+            "\nEnter multi-word fuzzy search query: "
+        );
+
         fflush(stdout);
 
-        if (!fgets(query_buffer,
-                   sizeof(query_buffer),
-                   stdin))
-            return 0;
+        if (!fgets(
+                query_buffer,
+                sizeof(query_buffer),
+                stdin)) {
 
-        query_buffer[strcspn(query_buffer, "\n")] = '\0';
+            break;
+        }
+
+        query_buffer[
+            strcspn(query_buffer, "\n")
+        ] = '\0';
 
         QueryConfig q_cfg;
 
-        if (!tokenize_query(query_buffer, &q_cfg)) {
-            printf("Empty or invalid query string.\n");
+        if (!tokenize_query(
+                query_buffer,
+                &q_cfg)) {
+
+            printf(
+                "Empty or invalid query string.\n"
+            );
+
             continue;
         }
 
         total_matches = 0;
 
-        printf("\n" COLOR_INFO "Category: %s" COLOR_RESET "\n",
-               CATEGORIES[selected_category - 1].name);
+        scanned_entries = 0;
+        scanned_files = 0;
+        scanned_directories = 0;
+        skipped_directories = 0;
+        skipped_symlinks = 0;
+        stat_errors = 0;
 
-        printf(COLOR_INFO
-               "Scanning Linux filesystem for matches "
-               "(Press Ctrl+C to abort)..."
-               COLOR_RESET "\n");
+        last_progress_time.tv_sec = 0;
+        last_progress_time.tv_nsec = 0;
 
-        search_directory_recursive(paths.internal, &q_cfg);
+        printf(
+            "\n" COLOR_INFO
+            "Category: %s"
+            COLOR_RESET "\n",
+            CATEGORIES[selected_category - 1].name
+        );
 
-        printf("\n" COLOR_INFO
-               "Total file paths matching query: %d"
-               COLOR_RESET "\n\n",
-               total_matches);
+        printf(
+            COLOR_INFO
+            "Scanning Linux root recursively..."
+            COLOR_RESET "\n"
+        );
+
+        printf(
+            "Press Ctrl+C to stop the current scan.\n\n"
+        );
+
+        fflush(stdout);
+
+        search_directory_recursive(
+            paths.internal,
+            &q_cfg
+        );
+
+        /*
+         * Put the terminal on a clean line after the live progress
+         * display.
+         */
+        printf("\n");
+
+        if (!keep_running) {
+            printf(
+                COLOR_INFO
+                "Search interrupted by Ctrl+C."
+                COLOR_RESET "\n"
+            );
+        }
+
+        print_scan_summary();
+
+        printf(
+            "\n"
+            COLOR_INFO
+            "Total file paths matching query: %d"
+            COLOR_RESET "\n\n",
+            total_matches
+        );
+
+        /*
+         * If Ctrl+C was pressed, leave the main loop instead of
+         * immediately starting another search.
+         */
+        if (!keep_running)
+            break;
     }
 
     return 0;
 }
 
+
+/*
+ * Linux does not need Android storage discovery.
+ *
+ * The search root is simply "/".
+ */
 void auto_discover_storage(StoragePaths *paths) {
-    /*
-     * Linux version:
-     * Search the entire filesystem starting at root (/).
-     *
-     * Android/Termux storage discovery has been removed.
-     */
-    strncpy(paths->internal, "/", MAX_PATH_LEN - 1);
+    memset(paths, 0, sizeof(*paths));
+
+    strncpy(
+        paths->internal,
+        "/",
+        MAX_PATH_LEN - 1
+    );
+
     paths->internal[MAX_PATH_LEN - 1] = '\0';
 
-    paths->external[0] = '\0';
     paths->has_external = 0;
 }
 
-int tokenize_query(const char *query, QueryConfig *q_cfg) {
+
+/*
+ * Split the search query into whitespace-separated tokens.
+ *
+ * Every token must occur somewhere in the path for the result to match.
+ */
+int tokenize_query(const char *query,
+                   QueryConfig *q_cfg) {
     q_cfg->count = 0;
 
     char temp[256];
 
-    strncpy(temp, query, sizeof(temp) - 1);
+    strncpy(
+        temp,
+        query,
+        sizeof(temp) - 1
+    );
+
     temp[sizeof(temp) - 1] = '\0';
 
-    char *token = strtok(temp, " ");
+    char *token = strtok(temp, " \t\r\n");
 
     while (token != NULL &&
            q_cfg->count < MAX_TOKENS) {
 
-        strncpy(q_cfg->tokens[q_cfg->count],
-                token,
-                MAX_TOKEN_LEN - 1);
+        strncpy(
+            q_cfg->tokens[q_cfg->count],
+            token,
+            MAX_TOKEN_LEN - 1
+        );
 
-        q_cfg->tokens[q_cfg->count][MAX_TOKEN_LEN - 1] =
-            '\0';
+        q_cfg->tokens[
+            q_cfg->count
+        ][MAX_TOKEN_LEN - 1] = '\0';
 
         q_cfg->count++;
 
-        token = strtok(NULL, " ");
+        token = strtok(
+            NULL,
+            " \t\r\n"
+        );
     }
 
     return q_cfg->count;
 }
 
-int execute_fzf_v1_match(const char *text,
-                         const QueryConfig *q_cfg,
-                         char *marker_mask) {
+
+/*
+ * Case-insensitive multi-token substring matching.
+ *
+ * All query tokens must be found somewhere in the path.
+ *
+ * marker_mask marks every character belonging to a matching token
+ * so the result can be highlighted.
+ */
+int execute_fzf_v1_match(
+    const char *text,
+    const QueryConfig *q_cfg,
+    char *marker_mask) {
+
     int text_len = (int)strlen(text);
 
-    memset(marker_mask, 0, text_len);
+    if (text_len <= 0)
+        return 0;
 
-    char *lower_text = malloc((size_t)text_len + 1);
+    memset(
+        marker_mask,
+        0,
+        (size_t)text_len
+    );
+
+    char *lower_text =
+        malloc((size_t)text_len + 1);
 
     if (!lower_text)
         return 0;
 
-    for (int i = 0; i < text_len; i++)
+    for (int i = 0; i < text_len; i++) {
         lower_text[i] =
-            (char)tolower((unsigned char)text[i]);
+            (char)tolower(
+                (unsigned char)text[i]
+            );
+    }
 
     lower_text[text_len] = '\0';
 
-    for (int t = 0; t < q_cfg->count; t++) {
+    for (int t = 0;
+         t < q_cfg->count;
+         t++) {
+
         char lower_tok[MAX_TOKEN_LEN];
 
         int tok_len =
-            (int)strlen(q_cfg->tokens[t]);
+            (int)strlen(
+                q_cfg->tokens[t]
+            );
 
-        for (int i = 0; i < tok_len; i++)
+        if (tok_len <= 0)
+            continue;
+
+        if (tok_len >= MAX_TOKEN_LEN)
+            tok_len = MAX_TOKEN_LEN - 1;
+
+        for (int i = 0;
+             i < tok_len;
+             i++) {
+
             lower_tok[i] =
                 (char)tolower(
-                    (unsigned char)q_cfg->tokens[t][i]);
+                    (unsigned char)
+                    q_cfg->tokens[t][i]
+                );
+        }
 
         lower_tok[tok_len] = '\0';
 
         char *match_ptr =
-            strstr(lower_text, lower_tok);
+            strstr(
+                lower_text,
+                lower_tok
+            );
 
+        /*
+         * Every token must be present.
+         */
         if (!match_ptr) {
             free(lower_text);
             return 0;
         }
 
+        /*
+         * Mark every occurrence of the token.
+         */
         while (match_ptr) {
             int start_idx =
-                (int)(match_ptr - lower_text);
+                (int)(
+                    match_ptr - lower_text
+                );
 
-            for (int m = 0; m < tok_len; m++)
-                marker_mask[start_idx + m] = 1;
+            for (int m = 0;
+                 m < tok_len;
+                 m++) {
+
+                if (start_idx + m < text_len)
+                    marker_mask[
+                        start_idx + m
+                    ] = 1;
+            }
 
             match_ptr =
-                strstr(lower_text + start_idx + 1,
-                       lower_tok);
+                strstr(
+                    lower_text +
+                        start_idx + 1,
+                    lower_tok
+                );
         }
     }
 
@@ -604,95 +1038,245 @@ int execute_fzf_v1_match(const char *text,
     return 1;
 }
 
-void search_directory_recursive(const char *dir_path,
-                                const QueryConfig *q_cfg) {
-    DIR *dir = opendir(dir_path);
+
+/*
+ * Recursive Linux filesystem scanner.
+ *
+ * Important differences from the original Android version:
+ *
+ * 1. lstat() is used instead of stat().
+ *    Therefore symlinks are detected without following them.
+ *
+ * 2. /proc, /sys, /dev and /run are skipped.
+ *
+ * 3. Every directory is checked before entering it.
+ *
+ * 4. Path lengths are checked before constructing full_path.
+ *
+ * 5. Ctrl+C is checked continuously.
+ *
+ * 6. Live progress is displayed while scanning.
+ */
+void search_directory_recursive(
+    const char *dir_path,
+    const QueryConfig *q_cfg) {
+
+    if (!keep_running)
+        return;
 
     /*
-     * Linux / contains directories that ordinary users cannot read.
-     * Simply skip those directories instead of terminating the search.
+     * Never enter the Linux virtual filesystem trees.
      */
-    if (!dir)
+    if (should_skip_directory(dir_path)) {
+        skipped_directories++;
         return;
+    }
+
+    DIR *dir = opendir(dir_path);
+
+    if (!dir) {
+        skipped_directories++;
+        return;
+    }
 
     struct dirent *entry;
 
     char mask[MAX_PATH_LEN];
     char full_path[MAX_PATH_LEN];
 
-    while ((entry = readdir(dir)) != NULL) {
+    while (keep_running &&
+           (entry = readdir(dir)) != NULL) {
+
+        /*
+         * Check the signal flag on every directory entry.
+         */
+        if (!keep_running)
+            break;
+
         if (strcmp(entry->d_name, ".") == 0 ||
             strcmp(entry->d_name, "..") == 0) {
             continue;
         }
 
-        /*
-         * Avoid overflowing full_path.
-         */
-        int needed = snprintf(
-            full_path,
-            sizeof(full_path),
-            "%s%s%s",
-            dir_path,
-            (strcmp(dir_path, "/") == 0) ? "" : "/",
-            entry->d_name
-        );
+        scanned_entries++;
 
-        if (needed < 0 ||
-            (size_t)needed >= sizeof(full_path)) {
+        /*
+         * Avoid constructing a path that cannot fit in our fixed
+         * buffer.
+         */
+        size_t dir_len =
+            strlen(dir_path);
+
+        size_t name_len =
+            strlen(entry->d_name);
+
+        size_t separator_len =
+            (strcmp(dir_path, "/") == 0)
+            ? 0
+            : 1;
+
+        if (dir_len +
+            separator_len +
+            name_len +
+            1 >
+            sizeof(full_path)) {
+
+            stat_errors++;
             continue;
         }
 
+        if (strcmp(dir_path, "/") == 0) {
+            snprintf(
+                full_path,
+                sizeof(full_path),
+                "/%s",
+                entry->d_name
+            );
+        } else {
+            snprintf(
+                full_path,
+                sizeof(full_path),
+                "%s/%s",
+                dir_path,
+                entry->d_name
+            );
+        }
+
+        /*
+         * lstat() does NOT follow symbolic links.
+         */
         struct stat statbuf;
 
-        /*
-         * stat() follows symlinks. This preserves the behavior
-         * of the original search program.
-         */
-        if (stat(full_path, &statbuf) != 0)
-            continue;
-
-        /*
-         * Directories are traversed but are never printed as
-         * search results.
-         *
-         * A result must be a regular file with an extension
-         * belonging to the selected category.
-         */
-        if (S_ISREG(statbuf.st_mode) &&
-            extension_matches_category(
+        if (lstat(
                 full_path,
-                selected_category)) {
+                &statbuf) != 0) {
 
-            if (execute_fzf_v1_match(
+            stat_errors++;
+
+            /*
+             * Show progress even when permissions prevent access.
+             */
+            update_progress(full_path);
+
+            continue;
+        }
+
+        /*
+         * Never traverse symbolic links.
+         *
+         * This prevents links such as:
+         *
+         * /somewhere/link -> /
+         *
+         * from causing a recursive loop through the whole system.
+         */
+        if (S_ISLNK(statbuf.st_mode)) {
+            skipped_symlinks++;
+
+            update_progress(full_path);
+
+            continue;
+        }
+
+        /*
+         * Regular file.
+         */
+        if (S_ISREG(statbuf.st_mode)) {
+            scanned_files++;
+
+            /*
+             * Only files belonging to the selected extension category
+             * are candidates for matching.
+             */
+            if (extension_matches_category(
                     full_path,
-                    q_cfg,
-                    mask)) {
+                    selected_category)) {
 
-                print_highlighted_result(
-                    full_path,
-                    mask,
-                    statbuf.st_mtime);
+                if (execute_fzf_v1_match(
+                        full_path,
+                        q_cfg,
+                        mask)) {
 
-                total_matches++;
+                    /*
+                     * Clear the live progress line before printing a
+                     * permanent search result.
+                     */
+                    printf(
+                        "\r\033[K"
+                    );
+
+                    print_highlighted_result(
+                        full_path,
+                        mask,
+                        statbuf.st_mtime
+                    );
+
+                    total_matches++;
+                }
             }
         }
 
-        if (S_ISDIR(statbuf.st_mode))
+        /*
+         * Directory.
+         */
+        else if (S_ISDIR(statbuf.st_mode)) {
+            scanned_directories++;
+
+            /*
+             * Check the exact path before descending.
+             *
+             * This catches:
+             * /proc
+             * /sys
+             * /dev
+             * /run
+             */
+            if (should_skip_directory(full_path)) {
+                skipped_directories++;
+
+                update_progress(full_path);
+
+                continue;
+            }
+
+            /*
+             * Recursively scan the normal Linux directory.
+             */
             search_directory_recursive(
                 full_path,
-                q_cfg);
+                q_cfg
+            );
+        }
+
+        /*
+         * Other filesystem objects are ignored:
+         *
+         * sockets
+         * FIFOs
+         * block devices
+         * character devices
+         * etc.
+         */
+
+        update_progress(full_path);
     }
 
     closedir(dir);
 }
 
-void print_highlighted_result(const char *text,
-                              const char *marker_mask,
-                              time_t modification_time) {
+
+/*
+ * Print result with matching characters highlighted.
+ */
+void print_highlighted_result(
+    const char *text,
+    const char *marker_mask,
+    time_t modification_time) {
+
     char date_buffer[64];
 
     struct tm time_info;
+
     struct tm *local =
         localtime(&modification_time);
 
@@ -705,33 +1289,46 @@ void print_highlighted_result(const char *text,
                 "%Y-%m-%d %H:%M:%S",
                 &time_info) == 0) {
 
-            strcpy(date_buffer, "unknown date");
+            strcpy(
+                date_buffer,
+                "unknown date"
+            );
         }
+
     } else {
-        strcpy(date_buffer, "unknown date");
+        strcpy(
+            date_buffer,
+            "unknown date"
+        );
     }
 
     /*
-     * Modification date is printed immediately before
-     * every result, in blue.
+     * Modification date immediately before the result.
      */
-    printf(COLOR_DATE "[%s]" COLOR_RESET " ",
-           date_buffer);
+    printf(
+        COLOR_DATE "[%s]"
+        COLOR_RESET " ",
+        date_buffer
+    );
 
     int len = (int)strlen(text);
+
     int inside_highlight = 0;
 
     for (int i = 0; i < len; i++) {
+
         if (marker_mask[i] &&
             !inside_highlight) {
 
             printf(COLOR_MATCH);
+
             inside_highlight = 1;
 
         } else if (!marker_mask[i] &&
                    inside_highlight) {
 
             printf(COLOR_RESET);
+
             inside_highlight = 0;
         }
 
